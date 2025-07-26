@@ -33,6 +33,7 @@ const __dirname = dirname(__filename);
 const root = join(__dirname, "..", "assets");
 const versionDir = join(root, ".v");
 const ignoreFile = join(root, ".ignore");
+const fileIgnoreFile = join(root, ".fignore");
 
 if (!existsSync(root)) {
   console.error(chalk.red(`✖ Directory does not exist: ${root}`));
@@ -51,24 +52,41 @@ if (existsSync(ignoreFile)) {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
-    .map((line) => join("assets", line.replace(/^\/+/, "")).replace(/\\/g, "/"));
+    .map((line) =>
+      join("assets", line.replace(/^\/+/, "")).replace(/\\/g, "/")
+    );
+}
+
+let fileIgnorePatterns = [];
+if (existsSync(fileIgnoreFile)) {
+  fileIgnorePatterns = readFileSync(fileIgnoreFile, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) =>
+      join("assets", line.replace(/^\/+/, "")).replace(/\\/g, "/")
+    );
 }
 
 /* --- Recursively walk local dir with progress bar --- */
 function walk(dir) {
   const files = [];
   const dirEntries = readdirSync(dir, { withFileTypes: true });
-  
-  // Initialize progress bar
+
+  // totalFiles hisoblash
   const totalFiles = dirEntries.reduce((count, entry) => {
     if (entry.isDirectory()) {
-      return count + readdirSync(join(dir, entry.name), { recursive: true }).length;
+      return (
+        count + readdirSync(join(dir, entry.name), { recursive: true }).length
+      );
     }
     return count + 1;
   }, 0);
-  
+
   const bar = new ProgressBar(
-    chalk.blue("Scanning files [:bar] :percent :current/:total (:etas remaining)"),
+    chalk.blue(
+      "Scanning files [:bar] :percent :current/:total (:etas remaining)"
+    ),
     {
       total: totalFiles,
       width: 40,
@@ -81,10 +99,18 @@ function walk(dir) {
     const entries = readdirSync(currentDir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = join(currentDir, entry.name);
-      if (entry.isFile() && !entry.name.startsWith(".") && !fullPath.includes(versionDir)) {
-        files.push(
-          join("assets", relative(root, fullPath)).replace(/\\/g, "/")
+      if (
+        entry.isFile() &&
+        !entry.name.startsWith(".") &&
+        !fullPath.includes(versionDir)
+      ) {
+        const fileKey = join("assets", relative(root, fullPath)).replace(
+          /\\/g,
+          "/"
         );
+        if (!isFileIgnoredCompletely(fileKey)) {
+          files.push(fileKey);
+        }
         bar.tick();
       } else if (entry.isDirectory()) {
         walkRecursive(fullPath);
@@ -149,8 +175,17 @@ function isIgnoredForVersioning(file) {
   return ignorePatterns.some((pattern) => file.startsWith(pattern));
 }
 
+function isFileIgnoredCompletely(file) {
+  return fileIgnorePatterns.some((pattern) => file.startsWith(pattern));
+}
+
 /* --- Upload a single file to S3 --- */
 async function uploadFile(file) {
+  if (isFileIgnoredCompletely(file)) {
+    console.log(chalk.gray(`⏩ Skipped upload (in .fignore): ${file}`));
+    return true;
+  }
+
   const fullPath = join(root, file.replace(/^assets\//, ""));
   const key = file;
   const fileBody = createReadStream(fullPath);
@@ -168,9 +203,7 @@ async function uploadFile(file) {
       },
     }).done();
     console.log(
-      chalk.green(
-        `✔ Uploaded ${key} (${(size / 1024).toFixed(2)} KB)`
-      )
+      chalk.green(`✔ Uploaded ${key} (${(size / 1024).toFixed(2)} KB)`)
     );
     return true;
   } catch (err) {
@@ -181,6 +214,11 @@ async function uploadFile(file) {
 
 /* --- Update local mtime file --- */
 function updateLocalMtimeFile(file, newMtime) {
+  if (isFileIgnoredCompletely(file)) {
+    console.log(chalk.gray(`⏩ Skipped mtime (in .fignore): ${file}`));
+    return true;
+  }
+
   const { mtimeFilePath } = getOrCreateMtimeFile(file);
   try {
     mkdirSync(dirname(mtimeFilePath), { recursive: true });
@@ -191,7 +229,9 @@ function updateLocalMtimeFile(file, newMtime) {
     return true;
   } catch (err) {
     console.error(
-      chalk.red(`✖ Failed to update local mtime file ${mtimeFilePath}: ${err.message}`)
+      chalk.red(
+        `✖ Failed to update local mtime file ${mtimeFilePath}: ${err.message}`
+      )
     );
     return false;
   }
@@ -201,14 +241,18 @@ function updateLocalMtimeFile(file, newMtime) {
 async function uploadMtimeFile(file) {
   if (isIgnoredForVersioning(file)) {
     console.log(
-      chalk.gray(`⏩ Skipped uploading mtime file for ${file} (ignored for versioning)`)
+      chalk.gray(
+        `⏩ Skipped uploading mtime file for ${file} (ignored for versioning)`
+      )
     );
     return true;
   }
 
   const { mtimeFilePath, mtimeS3Key } = getOrCreateMtimeFile(file);
   if (!existsSync(mtimeFilePath)) {
-    console.warn(chalk.yellow(`⚠ Skipping non-existent mtime file: ${mtimeFilePath}`));
+    console.warn(
+      chalk.yellow(`⚠ Skipping non-existent mtime file: ${mtimeFilePath}`)
+    );
     return false;
   }
 
@@ -227,7 +271,9 @@ async function uploadMtimeFile(file) {
     console.log(chalk.green(`✔ Uploaded ${mtimeS3Key}`));
     return true;
   } catch (err) {
-    console.error(chalk.red(`✖ Failed to upload ${mtimeS3Key}: ${err.message}`));
+    console.error(
+      chalk.red(`✖ Failed to upload ${mtimeS3Key}: ${err.message}`)
+    );
     return false;
   }
 }
@@ -242,9 +288,7 @@ function printFileTable(files, title) {
   console.log(chalk.blue.bold(`\n${title}:`));
   console.log(chalk.blue("-".repeat(50)));
   console.log(
-    chalk.white.bold(
-      `| ${"File".padEnd(35)} | ${"Size (KB)".padEnd(10)} |`
-    )
+    chalk.white.bold(`| ${"File".padEnd(35)} | ${"Size (KB)".padEnd(10)} |`)
   );
   console.log(chalk.blue("-".repeat(50)));
   files.forEach((file) => {
@@ -256,9 +300,7 @@ function printFileTable(files, title) {
     } catch (e) {
       // Stale files may not exist locally
     }
-    console.log(
-      `| ${file.padEnd(35)} | ${size.padEnd(10)} |`
-    );
+    console.log(`| ${file.padEnd(35)} | ${size.padEnd(10)} |`);
   });
   console.log(chalk.blue("-".repeat(50)));
 }
@@ -285,7 +327,9 @@ function printFileTable(files, title) {
 
   // Process each changed file sequentially
   const uploadBar = new ProgressBar(
-    chalk.blue("Uploading files [:bar] :percent :current/:total (:etas remaining)"),
+    chalk.blue(
+      "Uploading files [:bar] :percent :current/:total (:etas remaining)"
+    ),
     {
       total: changedFiles.length,
       width: 40,
@@ -323,7 +367,9 @@ function printFileTable(files, title) {
 
   // Delete stale files
   const deleteBar = new ProgressBar(
-    chalk.blue("Deleting stale files [:bar] :percent :current/:total (:etas remaining)"),
+    chalk.blue(
+      "Deleting stale files [:bar] :percent :current/:total (:etas remaining)"
+    ),
     {
       total: staleFiles.length,
       width: 40,
@@ -336,9 +382,7 @@ function printFileTable(files, title) {
     staleFiles.map((key) =>
       limit(async () => {
         try {
-          await s3.send(
-            new DeleteObjectCommand({ Bucket: bucket, Key: key })
-          );
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
           console.log(chalk.red(`🗑️ Deleted ${key}`));
           const mtimeKey = `assets/.v/${key.replace(/^assets\//, "")}`;
           if (remoteFiles.includes(mtimeKey) && !isIgnoredForVersioning(key)) {

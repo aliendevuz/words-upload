@@ -20,6 +20,7 @@ import dotenv from "dotenv";
 import pLimit from "p-limit";
 import chalk from "chalk";
 import ProgressBar from "progress";
+import { createHash } from "crypto";
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const root = join(__dirname, "..", "assets");
 const versionDir = join(root, ".v");
+const hashDir = join(root, ".hash")
 const ignoreFile = join(root, ".ignore");
 const fileIgnoreFile = join(root, ".fignore");
 
@@ -45,6 +47,11 @@ if (!existsSync(versionDir)) {
   mkdirSync(versionDir, { recursive: true });
 }
 
+// Create hash directory if it doesn't exist
+if (!existsSync(hashDir)) {
+  mkdirSync(hashDir, { recursive: true });
+}
+
 // Read .ignore file
 let ignorePatterns = [];
 if (existsSync(ignoreFile)) {
@@ -55,6 +62,20 @@ if (existsSync(ignoreFile)) {
     .map((line) =>
       join("assets", line.replace(/^\/+/, "")).replace(/\\/g, "/")
     );
+}
+
+/* --- Calculate SHA-256 hash for a file --- */
+function calculateFileHash(filePath) {
+  const fileBuffer = readFileSync(filePath);
+  return createHash("sha256").update(fileBuffer).digest("hex");
+}
+
+/* --- Get or create hash file --- */
+function getOrCreateHashFile(filePath) {
+  const hashFilePath = join(hashDir, filePath.replace(/^assets\//, "")) + ".sha256";
+  const hashS3Key = `assets/.hash/${filePath.replace(/^assets\//, "")}.sha256`;
+
+  return { hashFilePath, hashS3Key };
 }
 
 let fileIgnorePatterns = [];
@@ -179,6 +200,28 @@ function isFileIgnoredCompletely(file) {
   return fileIgnorePatterns.some((pattern) => file.startsWith(pattern));
 }
 
+/* --- Update local hash file --- */
+function updateLocalHashFile(file) {
+  if (isFileIgnoredCompletely(file)) {
+    console.log(chalk.gray(`⏩ Skipped hash (in .fignore): ${file}`));
+    return false;
+  }
+
+  const fullPath = join(root, file.replace(/^assets\//, ""));
+  const { hashFilePath } = getOrCreateHashFile(file);
+
+  try {
+    const hash = calculateFileHash(fullPath);
+    mkdirSync(dirname(hashFilePath), { recursive: true });
+    writeFileSync(hashFilePath, hash, "utf8");
+    console.log(chalk.magenta(`🔑 Updated local hash file ${hashFilePath}`));
+    return true;
+  } catch (err) {
+    console.error(chalk.red(`✖ Failed to update hash for ${file}: ${err.message}`));
+    return false;
+  }
+}
+
 /* --- Upload a single file to S3 --- */
 async function uploadFile(file) {
   if (isFileIgnoredCompletely(file)) {
@@ -233,6 +276,39 @@ function updateLocalMtimeFile(file, newMtime) {
         `✖ Failed to update local mtime file ${mtimeFilePath}: ${err.message}`
       )
     );
+    return false;
+  }
+}
+
+/* --- Upload hash file to S3 --- */
+async function uploadHashFile(file) {
+  if (isIgnoredForVersioning(file)) {
+    console.log(chalk.gray(`⏩ Skipped uploading hash for ${file} (ignored for versioning)`));
+    return true;
+  }
+
+  const { hashFilePath, hashS3Key } = getOrCreateHashFile(file);
+  if (!existsSync(hashFilePath)) {
+    console.warn(chalk.yellow(`⚠ Skipping non-existent hash file: ${hashFilePath}`));
+    return false;
+  }
+
+  try {
+    const hashBody = createReadStream(hashFilePath);
+    await new Upload({
+      client: s3,
+      params: {
+        Bucket: bucket,
+        Key: hashS3Key,
+        Body: hashBody,
+        ContentType: "text/plain",
+        CacheControl: "public,max-age=31536000,immutable",
+      },
+    }).done();
+    console.log(chalk.green(`✔ Uploaded ${hashS3Key}`));
+    return true;
+  } catch (err) {
+    console.error(chalk.red(`✖ Failed to upload ${hashS3Key}: ${err.message}`));
     return false;
   }
 }
@@ -355,6 +431,14 @@ function printFileTable(files, title) {
 
     // Step 3: Upload mtime file
     await limit(() => uploadMtimeFile(file));
+
+        // Step 4: Update local hash file
+    const hashUpdated = updateLocalHashFile(file);
+    if (!hashUpdated) continue;
+
+    // Step 5: Upload hash file
+    await limit(() => uploadHashFile(file));
+    
     uploadBar.tick();
   }
 
